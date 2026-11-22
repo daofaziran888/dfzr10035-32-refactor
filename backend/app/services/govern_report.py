@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.services.base import BaseModuleService
+from app.services.collect_alert import collect_alert_service
 from app.store import store
 
 
@@ -15,8 +16,25 @@ class GovernReportService(BaseModuleService):
     ACTION_RULES = {"生成报告": "已生成", "提交审核": "已审核", "归档报告": "已归档"}
     NEGATIVE_ACTIONS = []
 
+    def get_entry(self, entry_id: int) -> dict | None:
+        """报告详情附带来源核对信息；升级前登记的报告仍可核对原始来源。"""
+        report = super().get_entry(entry_id)
+        if report is None:
+            return None
+        report = dict(report)
+        report["来源核对"] = self._source_verification(report)
+        return report
+
     def run_action(self, entry_id: int, action: str):
         """生成报告时收集跨模块数据；审核时联动管道审计和调用日志。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is not None and action in ("生成报告", "归档报告"):
+            # 来源不完整的登记不能拿来生成或归档报告。
+            if collect_alert_service.is_incomplete_report(entry):
+                return None, (
+                    f"治理报告 {entry_id} 来源事实不完整，"
+                    "不能生成或归档，请先补全采集告警来源"
+                )
         entry, message = super().run_action(entry_id, action)
         if entry is None:
             return entry, message
@@ -30,6 +48,67 @@ class GovernReportService(BaseModuleService):
             self._snapshot_data_version(entry)
             message += "，已创建数据版本快照"
         return entry, message
+
+    def _source_verification(self, report: dict) -> dict:
+        """核对报告的采集告警来源，区分动作来源、升级前来源与来源待核。"""
+        report_no = str(report.get("报告编号", ""))
+        same_no = [
+            row for row in store.rows(self.MODULE)
+            if str(row.get("报告编号", "")) == report_no
+        ]
+        source_no = report.get("来源编号")
+        source = None
+        for row in store.rows(collect_alert_service.MODULE):
+            if source_no and row.get("来源编号") == source_no:
+                source = row
+                break
+        if source is None and not report.get("动作标识") and len(same_no) == 1:
+            # 升级前登记的报告没有来源链接：编号唯一时按原报告编号反查升级后来源；
+            # 同编号有多条报告时不做归属，保持来源待核。
+            for row in store.rows(collect_alert_service.MODULE):
+                if row.get("报告编号") == report_no:
+                    source = row
+                    break
+
+        archive_versions = [
+            ver for ver in store.rows("data_version")
+            if ver.get("版本编号") == f"DATA-GOV-{str(report.get('id', 0)).zfill(4)}"
+        ]
+        base = {
+            "报告编号": report_no,
+            "同编号报告数": len(same_no),
+            "归档版本": [ver.get("版本编号") for ver in archive_versions],
+        }
+        if source is not None:
+            base.update({
+                "来源状态": "来源已核",
+                "来源待核": False,
+                "来源编号": source.get("来源编号"),
+                "来源类型": source.get("来源类型"),
+                "动作标识": source.get("动作标识"),
+                "来源模块": source.get("来源模块"),
+                "来源记录编号": source.get("来源记录编号"),
+                "目标端点": source.get("目标端点"),
+                "登记时间": source.get("登记时间"),
+                "回执状态": source.get("回执状态"),
+                "来源完整性": source.get("来源状态"),
+                "核对说明": "可核对采集告警动作来源",
+            })
+            return base
+
+        # 只有编号线索且同编号有多条：详情须指出来源待核，保留每条原有归档关系。
+        ambiguous = len(same_no) > 1
+        base.update({
+            "来源状态": "来源待核" if ambiguous else "升级前来源",
+            "来源待核": ambiguous,
+            "来源编号": None,
+            "动作标识": None,
+            "核对说明": (
+                "同编号存在多条报告且缺少动作来源记录，来源待核，归档关系按各报告原记录保留"
+                if ambiguous else "升级前登记的报告，按报告原始字段核对来源"
+            ),
+        })
+        return base
 
     def _collect_cross_module_data(self, report: dict):
         """生成报告时采集跨模块统计。"""

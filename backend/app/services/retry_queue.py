@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.services.base import BaseModuleService
+from app.services.collect_alert import collect_alert_service
 from app.store import store
 
 
@@ -27,8 +28,12 @@ class RetryQueueService(BaseModuleService):
             self._update_monitor_health(entry)
             message += "，已更新调用日志和监控健康上报"
         elif action == "标记失败":
-            self._trigger_alert(entry)
+            result = self._trigger_alert(entry)
             message += "，已触发监控告警"
+            if result.get("recovered"):
+                message += "，回执丢失已按原动作标识找回原报告"
+            elif not result.get("created"):
+                message += "，治理报告已存在未重复建档"
         return entry, message
 
     def _log_retry_start(self, task: dict):
@@ -67,30 +72,18 @@ class RetryQueueService(BaseModuleService):
                     mon["status"] = "监控中"
                     mon["pending"] = True
 
-    def _trigger_alert(self, task: dict):
-        """永久失败触发监控告警和治理报告。"""
+    def _trigger_alert(self, task: dict) -> dict:
+        """永久失败触发监控告警，并通过共用采集告警来源登记治理报告。"""
         endpoint = task.get("失败端点", "")
-        tid = str(task["id"]).zfill(4)
         # 更新监控状态
         for mon in store.rows("api_monitor"):
             if mon.get("目标端点") == endpoint:
                 mon["status"] = "已告警"
                 mon["pending"] = False
                 mon["最近采样"] = "2026-11-17"
-        # 创建治理报告条目
-        gov_rows = store.rows("govern_report")
-        gov_rows.append({
-            "id": max((int(r.get("id", 0)) for r in gov_rows), default=0) + 1,
-            "报告编号": f"GOVE-RETRY-{tid}",
-            "评估范围": f"重放队列永久失败: {endpoint}",
-            "合规指标": "数据采集完整性",
-            "当前得分": 60.0,
-            "改进事项": f"任务{tid}重试耗尽，需人工介入",
-            "评估周期": "2026-Q4",
-            "负责人": "运维值班",
-            "生成时间": "2026-11-17",
-            "status": "待生成", "pending": True, "abnormal": True,
-        })
+        # 治理报告建档收拢到共用的采集告警来源服务（字段与历史行为保持一致）。
+        facts = collect_alert_service.build_retry_facts(task)
+        return collect_alert_service.register_alert(facts)
 
     def calc_recovery_rate(self) -> dict:
         """跨模块恢复率统计：分析重放队列成功/失败分布及关联调用日志。"""

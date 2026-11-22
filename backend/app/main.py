@@ -195,6 +195,45 @@ def chain_snapshot():
     return {"modules": results, "total_modules": len(results)}
 
 
+# ---------- 采集告警来源与动作回执（来源与回执分别检查） ----------
+
+@app.get("/api/chain/alert-receipt/{action_id:path}")
+def chain_alert_receipt(action_id: str):
+    """按动作标识只查动作回执，不改动报告与归档状态。"""
+    from app.services.collect_alert import collect_alert_service
+    view = collect_alert_service.receipt_view(action_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail=f"动作标识 {action_id} 无来源登记")
+    return view
+
+
+@app.post("/api/chain/alert-receipt/{action_id:path}/recover")
+def chain_alert_receipt_recover(action_id: str):
+    """回执丢失后在同一服务进程内按原动作标识找回原报告并补写回执。"""
+    from app.services.collect_alert import collect_alert_service
+    result = collect_alert_service.confirm_receipt(action_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"动作标识 {action_id} 无来源登记")
+    report = result["report"]
+    return {
+        "ok": True,
+        "source": result["source"],
+        "report_id": report.get("id") if report else None,
+        "报告编号": report.get("报告编号") if report else None,
+        "报告状态": report.get("status") if report else None,
+    }
+
+
+@app.get("/api/chain/report-source/{report_id}")
+def chain_report_source(report_id: int):
+    """从选中的报告核对采集告警来源（含升级前来源与来源待核标记）。"""
+    from app.services.govern_report import GovernReportService
+    report = GovernReportService().get_entry(report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"治理报告 {report_id} 不存在或已归档")
+    return report
+
+
 # 资源路由含 /api/{module}，必须放在 health / overview 及 chain 接口之后注册，
 # 否则固定路径会被动态路径抢先匹配。
 for module in ROUTERS:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.services.base import BaseModuleService
+from app.services.collect_alert import collect_alert_service
 from app.store import store
 
 
@@ -28,8 +29,12 @@ class SampleCheckService(BaseModuleService):
             self._update_cost_quota(entry)
             message += "，已更新用量配额"
         elif action == "标记告警":
-            self._trigger_govern_and_retry(entry)
+            result = self._trigger_govern_and_retry(entry)
             message += "，已触发治理报告和重放任务"
+            if result.get("recovered"):
+                message += "，回执丢失已按原动作标识找回原报告"
+            elif not result.get("created"):
+                message += "，治理报告已存在未重复建档"
         return entry, message
 
     def _sample_from_call_logs(self, check: dict):
@@ -65,38 +70,30 @@ class SampleCheckService(BaseModuleService):
                 cost["调用次数"] = int(cost.get("调用次数", 0)) + check.get("样本数量", 0)
                 cost["费用预估"] = float(cost.get("费用预估", 0.0)) + check.get("样本数量", 0) * 0.01
 
-    def _trigger_govern_and_retry(self, check: dict):
-        """偏差告警时创建治理报告和重放任务。"""
-        sid = str(check["id"]).zfill(4)
+    def _trigger_govern_and_retry(self, check: dict) -> dict:
+        """偏差告警时通过共用采集告警来源登记治理报告，并创建重放任务。"""
         endpoint = check.get("目标端点", "")
-        # 治理报告
-        gov_rows = store.rows("govern_report")
-        gov_rows.append({
-            "id": max((int(r.get("id", 0)) for r in gov_rows), default=0) + 1,
-            "报告编号": f"GOVE-SAMP-{sid}",
-            "评估范围": f"抽样偏差告警:{endpoint}",
-            "合规指标": "数据质量一致性",
-            "当前得分": 55.0,
-            "改进事项": f"端点{endpoint}抽样偏差超出阈值{check.get('偏差阈值', '')}",
-            "评估周期": "2026-Q4",
-            "负责人": "数据质量组",
-            "生成时间": "2026-11-17",
-            "status": "待生成", "pending": True, "abnormal": True,
-        })
-        # 重放任务
+        # 治理报告建档收拢到共用的采集告警来源服务（字段与历史行为保持一致）。
+        facts = collect_alert_service.build_sample_facts(check)
+        result = collect_alert_service.register_alert(facts)
+        # 重放任务仍由抽样领域按原动作产生；同一动作标识重试时不重复建任务。
+        sid = str(check["id"]).zfill(4)
+        task_no = f"RETR-SAMP-{sid}"
         retry_rows = store.rows("retry_queue")
-        retry_rows.append({
-            "id": max((int(r.get("id", 0)) for r in retry_rows), default=0) + 1,
-            "任务编号": f"RETR-SAMP-{sid}",
-            "失败端点": endpoint,
-            "失败原因": f"抽样偏差告警:{check.get('校验字段', '')}",
-            "重试次数": 0,
-            "最大重试": 3,
-            "退避策略": "linear:5s",
-            "最后重试": "",
-            "队列状态": "sample_deviation",
-            "status": "待重试", "pending": True, "abnormal": True,
-        })
+        if not any(row.get("任务编号") == task_no for row in retry_rows):
+            retry_rows.append({
+                "id": max((int(r.get("id", 0)) for r in retry_rows), default=0) + 1,
+                "任务编号": task_no,
+                "失败端点": endpoint,
+                "失败原因": f"抽样偏差告警:{check.get('校验字段', '')}",
+                "重试次数": 0,
+                "最大重试": 3,
+                "退避策略": "linear:5s",
+                "最后重试": "",
+                "队列状态": "sample_deviation",
+                "status": "待重试", "pending": True, "abnormal": True,
+            })
+        return result
 
     def calc_sampling_coverage(self) -> dict:
         """跨模块抽样覆盖率统计。"""

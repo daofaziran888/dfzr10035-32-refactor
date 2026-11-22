@@ -20,6 +20,7 @@ from app.services.call_log import CallLogService
 from app.services.data_version import DataVersionService
 from app.services.pipeline_audit import PipelineAuditService
 from app.services.govern_report import GovernReportService
+from app.services.collect_alert import CollectAlertService, collect_alert_service
 from app.services.incr_tracker import IncrTrackerService
 from app.services.sample_check import SampleCheckService
 from app.services.cost_account import CostAccountService
@@ -44,6 +45,8 @@ SERVICES: dict[str, BaseModuleService] = {
     "data_version": DataVersionService(),
     "pipeline_audit": PipelineAuditService(),
     "govern_report": GovernReportService(),
+    # 注册同一个单例：资源路由读到的来源/回执与重放、抽样写档用的是同一把幂等锁。
+    "collect_alert_source": collect_alert_service,
     "incr_tracker": IncrTrackerService(),
     "sample_check": SampleCheckService(),
     "cost_account": CostAccountService(),
